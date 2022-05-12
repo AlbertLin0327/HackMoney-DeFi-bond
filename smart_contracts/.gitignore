@@ -1,0 +1,15 @@
+node_modules
+package-lock.json
+.env
+coverage
+coverage.json
+typechain
+
+#Hardhat files
+cache
+artifacts
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
