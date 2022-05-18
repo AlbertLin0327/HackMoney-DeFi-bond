@@ -43,9 +43,9 @@ contract PrivateBond is Bond {
      **     USER SECTION    **
      *************************/
 
-    function purchaseBond(uint256 _amount, bytes32[] memory proof)
+    function purchaseBond(uint256 _amount, bytes32[] memory _proof)
         external
-        validPurchaser(proof)
+        validPurchaser(_proof)
         bondHadSet
         nonReentrant
     {
