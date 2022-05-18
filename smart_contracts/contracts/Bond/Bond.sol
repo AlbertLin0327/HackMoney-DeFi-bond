@@ -5,7 +5,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/// @title iRIS Bond main contract
+/// @title veiRIS Bond main contract
 /// @author hklin
 /// @notice Every contract stands for one bond
 /// @dev    Notice that this should be produce by an upgradable extension
@@ -28,6 +28,7 @@ struct BondFeature {
 struct Debt {
     uint256 baseDebt;
     uint256 convertibleDebt;
+    uint256 incentive;
 }
 
 /// @notice Control the sale of the bond
@@ -44,6 +45,12 @@ struct Share {
     uint256 lastRedeemCoupon; // Record the last coupon redeemed of the bond
 }
 
+interface IstakingContract {
+    function lock(address _sender, uint256 _amount) external;
+
+    function unlock(address _sender, uint256 _amount) external;
+}
+
 contract Bond is Ownable, ReentrancyGuard {
     using PRBMathUD60x18 for uint256;
     using SafeERC20 for IERC20;
@@ -52,17 +59,25 @@ contract Bond is Ownable, ReentrancyGuard {
      **    MAIN VARIABLE     **
      *************************/
 
-    address public immutable iRIS; // iRIS token -- governance token
+    address public immutable veiRIS; // veiRIS token -- governance token
     address public immutable treasury; // Team treasury to collect fees
+    address public immutable stakingContract; // The contract to stake token
+
+    mapping(address => uint256) LPprovider;
 
     Sale public sale; // main contract of bond sale
     BondFeature public bond; // main control variable of the bond
     Debt public debt; // the current debt of the bond
     mapping(address => Share) public holder; // information of each share
 
-    constructor(address iRIS_, address treasury_) {
-        iRIS = iRIS_;
+    constructor(
+        address veiRIS_,
+        address treasury_,
+        address stakingContract_
+    ) {
+        veiRIS = veiRIS_;
         treasury = treasury_;
+        stakingContract = stakingContract_;
     }
 
     /*************************
@@ -77,10 +92,6 @@ contract Bond is Ownable, ReentrancyGuard {
         uint256 _baseAmount,
         uint256 _convertAmount
     );
-
-    modifier validPurchaser() {
-        _;
-    }
 
     modifier bondHadSet() {
         require(bond.hadSet, "bond not finish setting");
@@ -116,16 +127,24 @@ contract Bond is Ownable, ReentrancyGuard {
 
         debt = Debt({
             baseDebt: debt.baseDebt - _baseAmount,
-            convertibleDebt: debt.convertibleDebt - _convertibleAmount
+            convertibleDebt: debt.convertibleDebt - _convertibleAmount,
+            incentive: debt.incentive
         });
     }
 
-    function purchaseBond(uint256 _amount)
-        external
-        validPurchaser
-        bondHadSet
-        nonReentrant
-    {
+    function payIncentive(uint256 _incentive) external bondHadSet nonReentrant {
+        require(
+            msg.sender == bond.issuer,
+            "Make sure the one paying is issuer"
+        );
+        require(debt.incentive <= _incentive, "Pay too much incentive");
+
+        IERC20(bond.baseToken).safeTransfer(msg.sender, _incentive);
+
+        debt.incentive = debt.incentive - _incentive;
+    }
+
+    function purchaseBond(uint256 _amount) external bondHadSet nonReentrant {
         require(msg.sender != address(0), "address is valid");
         require(_amount >= bond.minShare, "require larger share");
         require(
@@ -137,6 +156,10 @@ contract Bond is Ownable, ReentrancyGuard {
         require(block.number <= sale.saleEnd, "Sale has ended");
 
         address _baseToken = bond.baseToken;
+
+        uint256 fee = bondFee(_amount);
+        IERC20(_baseToken).safeTransfer(treasury, _amount);
+        _amount -= fee;
 
         // transfer fund to conrtact after calling "safeIncreaseAllowance"
         IERC20(_baseToken).safeTransferFrom(msg.sender, address(this), _amount);
@@ -160,10 +183,12 @@ contract Bond is Ownable, ReentrancyGuard {
         // Update debt information
         uint256 _convertibleDebt = _amount.mul(newConvertPrecent);
         uint256 _baseDebt = _amount - _convertibleDebt;
+        uint256 _incentive = _amount.mul(5e15);
 
         debt = Debt({
             baseDebt: debt.baseDebt + _baseDebt,
-            convertibleDebt: debt.convertibleDebt + _convertibleDebt
+            convertibleDebt: debt.convertibleDebt + _convertibleDebt,
+            incentive: debt.incentive + _incentive
         });
 
         emit NewBondPurchased(msg.sender, _amount);
@@ -195,6 +220,7 @@ contract Bond is Ownable, ReentrancyGuard {
         // if all coupon is redeemed, payback the principle
         if (totalRedeemable > bond.couponTime) {
             payout += _holder.purchasedPrinciple;
+
             delete holder[msg.sender];
             payoutBond(msg.sender, payout, _holder.convertPrecent);
         } else {
@@ -205,6 +231,27 @@ contract Bond is Ownable, ReentrancyGuard {
 
     function maturityDate() external view bondHadSet returns (uint256) {
         return sale.saleEnd + bond.couponInterval * bond.couponTime;
+    }
+
+    function provideInsurance(uint256 _amount)
+        external
+        bondHadSet
+        nonReentrant
+    {
+        IstakingContract(stakingContract).lock(msg.sender, _amount);
+        LPprovider[msg.sender] += _amount;
+    }
+
+    function redeemInsurance() external bondHadSet nonReentrant {
+        require(
+            (debt.baseDebt == 0) &&
+                (debt.convertibleDebt == 0) &&
+                (debt.incentive == 0),
+            "Not yet payout"
+        );
+
+        uint256 extractAmount = LPprovider[msg.sender];
+        IstakingContract(stakingContract).unlock(msg.sender, extractAmount);
     }
 
     /*************************
@@ -234,6 +281,10 @@ contract Bond is Ownable, ReentrancyGuard {
 
             emit BondRedeemed(_purchaser, basePayout, convertPayout);
         }
+    }
+
+    function bondFee(uint256 _amount) internal pure returns (uint256) {
+        return _amount.mul(5e14);
     }
 
     /*************************
